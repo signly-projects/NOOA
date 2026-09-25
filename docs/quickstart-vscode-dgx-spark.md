@@ -77,7 +77,7 @@ nemotron-3-nano:4b
 ## 4. List the client types
 
 ```
-cd /home/md84419/source/NOOA && uv run python -c "
+cd /home/<User>/source/NOOA && uv run python -c "
 from nooa.unifiedllm.registry import get_llm_client
 for alias in ('dgx-coder', 'dgx-general', 'dgx-fast', 'dgx-big'):
     try:
@@ -104,19 +104,19 @@ Create `.nooa/llm_config.yaml` in the project root:
 models:
   dgx-coder:
     model_name: ollama_chat/qwen3-coder:30b
-    api_base: http://spark-a44c.taild8006f.ts.net:11434
+    api_base: http://<spark-hostname>.<tailnet>.ts.net:11434
 
   dgx-general:
     model_name: ollama_chat/qwen3.6:35b-a3b
-    api_base: http://spark-a44c.taild8006f.ts.net:11434
+    api_base: http://<spark-hostname>.<tailnet>.ts.net:11434
 
   dgx-fast:
     model_name: ollama_chat/nemotron-3-nano:4b
-    api_base: http://spark-a44c.taild8006f.ts.net:11434
+    api_base: http://<spark-hostname>.<tailnet>.ts.net:11434
 
   dgx-big:
     model_name: ollama_chat/gpt-oss:120b
-    api_base: http://spark-a44c.taild8006f.ts.net:11434
+    api_base: http://<spark-hostname>.<tailnet>.ts.net:11434
 ```
 
 Project-local config sits on the discovery chain (bundled < user-global <
