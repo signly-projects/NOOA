@@ -16,6 +16,20 @@ class LSPClientError(Exception):
     """Exception raised for LSP client errors."""
 
 
+class LSPClientStatus:
+    """Lifecycle/health states for an LSPClient.
+
+    Lets validation gates distinguish "the code has an error" from
+    "the language server crashed": queries against a non-COMPLETE
+    client cannot be trusted as evidence about the code.
+    """
+
+    UNKNOWN = "UNKNOWN"      # constructed, initialize not yet completed
+    COMPLETE = "COMPLETE"    # initialize handshake succeeded; healthy
+    DEGRADED = "DEGRADED"    # server sent undecodable data; may be unreliable
+    FAILED = "FAILED"        # connection lost / server process gone
+
+
 class LSPClient:
     """A generic LSP JSON-RPC client."""
 
@@ -27,7 +41,10 @@ class LSPClient:
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._diagnostics: Dict[str, list[Any]] = {}
         self._run_task: asyncio.Task | None = None
+        self._watch_task: asyncio.Task | None = None
         self.capabilities: dict[str, Any] = {}
+        self.status: str = LSPClientStatus.UNKNOWN
+        self._decode_errors: int = 0
 
     async def start(self) -> InitializeResult:
         """Start the LSP server process and initialize the connection."""
@@ -38,6 +55,10 @@ class LSPClient:
             stderr=asyncio.subprocess.PIPE,
         )
         self._run_task = asyncio.create_task(self._read_loop())
+        self._watch_task = asyncio.create_task(self._watch_process())
+        # Process is up; the handshake itself happens while DEGRADED (not yet
+        # COMPLETE) so _send's guard doesn't reject the initialize request.
+        self.status = LSPClientStatus.DEGRADED
 
         # Send initialize
         init_res = await self.send_request(
@@ -58,6 +79,14 @@ class LSPClient:
 
         # Send initialized
         await self.send_notification("initialized", {})
+        # Only promote to COMPLETE from the handshake state. The read loop runs
+        # concurrently and may already have flagged DEGRADED (undecodable frame)
+        # or FAILED (server died) while we awaited — don't clobber either.
+        if self.status not in (LSPClientStatus.FAILED, LSPClientStatus.DEGRADED):
+            self.status = LSPClientStatus.COMPLETE
+        elif self.status == LSPClientStatus.DEGRADED and not self._decode_errors:
+            # DEGRADED here is just the handshake placeholder, not a decode error.
+            self.status = LSPClientStatus.COMPLETE
         return InitializeResult(capabilities=self.capabilities)
 
     async def stop(self):
@@ -80,9 +109,13 @@ class LSPClient:
                         pass
                     
             await self.process.wait()
+        # Server is gone either way; no query result can be trusted past here.
+        self.status = LSPClientStatus.FAILED
             
         if self._run_task and not self._run_task.done():
             self._run_task.cancel()
+        if self._watch_task and not self._watch_task.done():
+            self._watch_task.cancel()
 
     async def _read_loop(self):
         try:
@@ -91,6 +124,7 @@ class LSPClient:
                 while True:
                     line_bytes = await self.process.stdout.readline()
                     if not line_bytes:
+                        self._mark_connection_lost()
                         return
                     line_str = line_bytes.decode("utf-8").strip()
                     if not line_str:
@@ -100,17 +134,65 @@ class LSPClient:
                         
                 if content_length is None:
                     continue
-                    
-                content = await self.process.stdout.readexactly(content_length)
+
+                try:
+                    content = await self.process.stdout.readexactly(content_length)
+                except asyncio.IncompleteReadError:
+                    self._mark_connection_lost()
+                    return
                 try:
                     message = json.loads(content)
                     self._handle_message(message)
                 except json.JSONDecodeError:
+                    self._decode_errors += 1
+                    self.status = LSPClientStatus.DEGRADED
                     logger.error("Failed to decode LSP message: %s", content)
+            # The loop only ends when the stream reaches EOF: the pipe closed
+            # under us, so the server is gone. asyncio's process.wait() can stay
+            # pending even after the child dies (returncode set, waiter never
+            # woken), so EOF here — not _watch_process — is the reliable death
+            # signal for a real server.
+            self._mark_connection_lost()
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            self._mark_connection_lost()
             logger.error("LSP Read Error: %s", e)
+
+    def _mark_connection_lost(self):
+        """Flag the client FAILED and fail any in-flight requests.
+
+        A dead server must never look like healthy code to a validation gate,
+        and a request awaiting a reply that will never come must raise rather
+        than hang. Called from the read loop on EOF/read error and from
+        _watch_process when the server process exits.
+        """
+        self.status = LSPClientStatus.FAILED
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.set_exception(LSPClientError("LSP connection lost"))
+        self._pending_requests.clear()
+
+    async def _watch_process(self):
+        """Mark the client FAILED if the server process dies unexpectedly.
+
+        ValidationPolicy gates key off ``status``: a dead server must never
+        look like clean code. A clean stop() flips status to FAILED itself
+        before awaiting process exit, so this only fires on unexpected death.
+
+        Poll ``returncode`` rather than ``await process.wait()``: a wrapper
+        server (e.g. pyright's node launcher) can spawn a child that inherits
+        the stdout pipe, so killing the parent leaves the pipe open — the read
+        loop never sees EOF and asyncio's wait() can stay pending even though
+        the parent was reaped and ``returncode`` is set. The reaped exit code
+        is the one reliable death signal in that case.
+        """
+        try:
+            while self.process is not None and self.process.returncode is None:
+                await asyncio.sleep(0.05)
+            self._mark_connection_lost()
+        except asyncio.CancelledError:
+            pass
 
     def _handle_message(self, message: dict[str, Any]):
         if "id" in message and "method" not in message:
@@ -158,7 +240,10 @@ class LSPClient:
         self._send(msg)
 
     def _send(self, message: dict[str, Any]):
+        if self.status in (LSPClientStatus.FAILED, LSPClientStatus.UNKNOWN):
+            raise LSPClientError(f"LSP server not available (status={self.status})")
         if not self.process or not self.process.stdin:
+            self.status = LSPClientStatus.FAILED
             raise LSPClientError("Not connected")
         content = json.dumps(message).encode("utf-8")
         header = f"Content-Length: {len(content)}\r\n\r\n".encode("utf-8")
